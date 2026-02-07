@@ -119,3 +119,38 @@ class AEROState:
             TXc_prev=np.zeros((num_prefixes, num_shards), dtype=np.float32),
             TXi_prev=np.zeros((num_prefixes, num_shards), dtype=np.float32),
         )
+
+    @classmethod
+    def from_vector(
+        cls,
+        vec: np.ndarray,
+        CST_per_shard: np.ndarray,
+        IST_per_shard: np.ndarray,
+        num_shards: int,
+        num_prefixes: int,
+    ) -> "AEROState":
+        """Reconstruct AEROState from state vector and CST/IST (e.g. for checkpoint resume)."""
+        N, P = num_shards, num_prefixes
+        ofs = 0
+        part1 = vec[ofs : ofs + 3 * N]
+        ofs += 3 * N
+        part2 = vec[ofs : ofs + P * N].reshape(P, N)
+        ofs += P * N
+        part3 = vec[ofs : ofs + P * N].reshape(P, N)
+        ofs += P * N
+        part4 = vec[ofs : ofs + P * N].reshape(P, N)
+        ofs += P * N
+        part5 = vec[ofs : ofs + P * N].reshape(P, N)
+        return cls(
+            num_shards=N,
+            num_prefixes=P,
+            T_t=part1[:N].tolist(),
+            C_t=part1[N : 2 * N].tolist(),
+            V_t=part1[2 * N : 3 * N].tolist(),
+            CST_per_shard=np.asarray(CST_per_shard).tolist(),
+            IST_per_shard=np.asarray(IST_per_shard).tolist(),
+            TXc_t=part2.astype(np.float32),
+            TXi_t=part3.astype(np.float32),
+            TXc_prev=part4.astype(np.float32),
+            TXi_prev=part5.astype(np.float32),
+        )

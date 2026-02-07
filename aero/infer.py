@@ -18,8 +18,15 @@ from .action import MigrationTransaction
 from .network import AEROPolicyValueNet
 
 
-def load_aero(checkpoint_path: str, device: str = "cpu") -> tuple:
+def _default_device() -> str:
+    """Use GPU if available, else CPU."""
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def load_aero(checkpoint_path: str, device: Optional[str] = None) -> tuple:
     """Load trained AERO net and config from checkpoint. Returns (net, config)."""
+    if device is None:
+        device = _default_device()
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = ckpt.get("net", ckpt)
     config = ckpt.get("config")
@@ -42,7 +49,7 @@ def get_migration_plan(
     action_history: Optional[np.ndarray] = None,
     max_migrations: Optional[int] = None,
     deterministic: bool = True,
-    device: Union[str, torch.device] = "cpu",
+    device: Optional[Union[str, torch.device]] = None,
 ) -> List[MigrationTransaction]:
     """
     Produce migration plan (list of MigrationTransaction) for the given state.
@@ -52,7 +59,9 @@ def get_migration_plan(
     - max_migrations: max length of plan; default config.max_migrations_per_epoch.
     - deterministic: if True, use mean action; else sample.
     """
-    if isinstance(device, str):
+    if device is None:
+        device = torch.device(_default_device())
+    elif isinstance(device, str):
         device = torch.device(device)
     K = max_migrations or config.max_migrations_per_epoch
     L = config.action_history_len

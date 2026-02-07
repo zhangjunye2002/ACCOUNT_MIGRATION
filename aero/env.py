@@ -215,3 +215,14 @@ class AEROEnv:
         for i, (s, t, p) in enumerate(h):
             out[i, 0], out[i, 1], out[i, 2] = s, t, p
         return out
+
+    def set_state(
+        self,
+        prefix_to_shard: np.ndarray,
+        epoch: int,
+        action_history_tuples: List[Tuple[int, int, int]],
+    ) -> None:
+        """Restore env internal state (for checkpoint resume)."""
+        self._prefix_to_shard = np.asarray(prefix_to_shard, dtype=np.int32)
+        self._epoch = int(epoch)
+        self._action_history = list(action_history_tuples)

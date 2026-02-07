@@ -14,27 +14,106 @@
 | Appendix B 超参 | `aero/config.py`：γ=0.99, 6 heads, batch 128, lr 1e-5 等 |
 | PPO | `aero/ppo.py`：clip + value/entropy loss，自回归序列的 log_prob |
 
-## 环境与运行
+---
+
+## 环境与依赖
 
 ```bash
-pip install -r requirements.txt   # numpy, torch
+pip install -r requirements.txt   # numpy, torch（建议安装带 CUDA 的 torch 以使用 GPU）
+```
+
+---
+
+## 训练（train.py）
+
+### 两种数据来源
+
+| 模式 | 说明 | 用法 |
+|------|------|------|
+| **仿真环境** | 不读文件，用 `AEROEnv` 随机/启发式生成状态与奖励 | 不传 `--csv-path` |
+| **CSV 数据** | 用交易 CSV 驱动，每步 = 一个 epoch 的聚合状态与真实 reward | 传 `--csv-path <CSV 路径>` |
+
+### 基本用法
+
+**仅用仿真环境训练（默认）：**
+
+```bash
 python train.py --total-steps 50000 --batch-size 128 --seed 0
 ```
 
-训练脚本会使用**仿真环境**（`aero/env.py` 中的 `_step_transition`）生成下一状态与奖励。将来接入 BlockEmulator 时，只需替换为从 emulator 取 `(s', r)` 的逻辑。
+**用 CSV 数据训练（推荐，与论文数据一致）：**
 
-### GPU 加速（可选）
+```bash
+python train.py --csv-path 22000000to22249999_BlockTransaction/22000000to22249999_BlockTransaction.csv --total-steps 50000 --batch-size 128 --seed 0
+```
 
-- **当前检测**：本机若已安装的是 `torch` 的 **CPU 版**（如 `2.x.x+cpu`），则不会使用 GPU；训练开始时会打印 `Using device: cpu`。
-- **若你有 NVIDIA 显卡**：
-  1. 在终端执行 `nvidia-smi`，能正常输出显卡与驱动版本则说明驱动可用。
-  2. 先卸载 CPU 版再安装带 CUDA 的 PyTorch（在 [pytorch.org](https://pytorch.org/get-started/locally/) 按系统与 CUDA 版本选命令），例如 CUDA 12.1：
-     ```bash
-     pip uninstall torch -y
-     pip install torch --index-url https://download.pytorch.org/whl/cu121
-     ```
-  3. 无需改代码：`train.py` 里已用 `device = torch.device("cuda" if torch.cuda.is_available() else "cpu")`，装好 CUDA 版 PyTorch 后重新运行 `python train.py`，会打印 `Using device: cuda` 并自动用 GPU。
-- **若没有 NVIDIA 显卡或 `nvidia-smi` 不可用**：用 CPU 训练即可，只是每批会慢一些。
+### 训练参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--total-steps` | 50000 | 总训练步数（每步 = 1 个 epoch） |
+| `--batch-size` | 128 | 每批样本数，收集满一批后做一次 PPO 更新 |
+| `--seed` | 0 | 随机种子 |
+| `--save-dir` | checkpoints | 检查点保存目录 |
+| `--save-every` | 2500 | 每多少步保存一次检查点（如 aero_2500.pt, aero_5000.pt） |
+| `--log-interval` | 10 | 每多少个 batch 打印一次 loss/reward |
+| `--device` | 自动 | 强制设备：`cuda` 或 `cpu`；不传则自动选 GPU（若有） |
+| `--resume` | - | 从检查点恢复：`--resume checkpoints/aero_5000.pt` |
+| `--csv-path` | - | 使用 CSV 训练时传入 CSV 路径 |
+| `--blocks-per-epoch` | 100 | 使用 CSV 时，每个 epoch 包含的区块数 |
+
+### 检查点与恢复
+
+- **定期保存**：每 `--save-every` 步（默认 2500）保存到 `checkpoints/aero_{step}.pt`。
+- **训练结束**：保存 `checkpoints/aero_final.pt`。
+- **中途中断**：按 **Ctrl+C** 会保存 `checkpoints/aero_interrupt_{step}.pt`，可据此恢复。
+- **从检查点继续**：  
+  ```bash
+  python train.py --resume checkpoints/aero_2500.pt --total-steps 50000 ...
+  ```  
+  用 CSV 时需同时带上 `--csv-path`，例如：  
+  ```bash
+  python train.py --resume checkpoints/aero_interrupt_2688.pt --csv-path 22000000to22249999_BlockTransaction/22000000to22249999_BlockTransaction.csv --total-steps 50000 --batch-size 128 --seed 0
+  ```
+
+### GPU 加速
+
+- 若已安装带 CUDA 的 PyTorch，脚本会自动使用 GPU，并打印 `Using device: cuda` 与显卡名称。
+- 强制使用 CPU：`--device cpu`。
+- 仅 CPU 版 PyTorch 时只会用 CPU，需从 [pytorch.org](https://pytorch.org/get-started/locally/) 安装 CUDA 版方可使用 GPU。
+
+---
+
+## 用 CSV 做数据流/推理（run_with_csv.py）
+
+不训练、仅按 epoch 流式读 CSV，聚合成 `AEROState` 并打印 reward（可选加载已训练模型）。
+
+### 基本用法
+
+```bash
+# 默认读 22000000to22249999_BlockTransaction/22000000to22249999_BlockTransaction.csv
+python run_with_csv.py
+```
+
+### 参数
+
+| 参数 | 说明 |
+|------|------|
+| `--csv-path` | 指定 CSV 路径（否则用默认路径） |
+| `--checkpoint` | 加载 AERO 模型（如 `checkpoints/aero_final.pt`） |
+| `--save-state` | 将进度保存到文件（如 `csv_state.npz`） |
+| `--save-state-every` | 每 N 个 epoch 保存一次进度（默认 10） |
+| `--resume-state` | 从保存的进度文件恢复，跳过已处理 block |
+| `--max-epochs` | 最多跑多少个 epoch 后停止 |
+
+示例：边跑边保存、之后恢复：
+
+```bash
+python run_with_csv.py --save-state csv_state.npz --save-state-every 10
+python run_with_csv.py --resume-state csv_state.npz
+```
+
+---
 
 ## 与 BlockEmulator 的对接思路
 
@@ -49,22 +128,20 @@ python train.py --total-steps 50000 --batch-size 128 --seed 0
 3. **奖励**：在 emulator 中按同一公式计算 R_t（或由 DRL 侧用 `reward_from_state(next_state, w1, w2)` 计算），用于在线微调或仅做监控。
 4. **环境替换**：在 `AEROEnv.step()` 中，将 `_step_transition(...)` 改为：把当前 `state` 和 `action` 发给 BlockEmulator，用其返回的下一状态和统计量构造 `next_state` 与 `reward`。
 
+---
+
 ## 数据加载模块（与 AERO 低耦合）
 
-`data/` 负责**按块流式读大 CSV**，产出通用结构，**不依赖 aero**；和 AERO 的耦合只在一处：`aero/data_adapter.py` 把 `RawEpochStats` 转成 `AEROState`。后续改成 BlockEmulator 时，只需让 BlockEmulator 产出同结构的 `RawEpochStats`（或在此 adapter 里改为「BlockEmulator 输出 → AEROState」）。
+`data/` 负责**按块流式读大 CSV**，产出通用结构，**不依赖 aero**；和 AERO 的耦合只在一处：`aero/data_adapter.py` 把 `RawEpochStats` 转成 `AEROState`。
 
 - **data/schema.py**：`EpochBatch(block_start, block_end, transactions)`、`RawEpochStats(cst_per_shard, ist_per_shard, txc, txi)`，无 aero 依赖。
 - **data/csv_stream.py**：`stream_epochs(csv_path, blocks_per_epoch)`，按行流式读 CSV，按 block 汇聚为 `EpochBatch`。列名默认 `blockNumber` / `from` / `to`（XBlock-ETH 格式），可传参覆盖。
 - **data/aggregator.py**：`aggregate_epoch(batch, prefix_to_shard, num_shards, num_prefixes, ...)`，从 `(from, to)` 列表得到 `RawEpochStats`。地址→prefix 默认取 0x 后前 8 bit。
 - **aero/data_adapter.py**：`raw_stats_to_aero_state(current, num_shards, num_prefixes, prev)`，唯一从「通用统计」到「AERO 状态」的转换点。
 
-示例：用本地交易 CSV 驱动 AERO 输入（不做训练，仅做数据流连通性检查）：
+**前提**：CSV 按 `blockNumber` 递增（或至少同一 block 内连续），否则需先按块排序再喂给 `stream_epochs`。
 
-```bash
-python run_with_csv.py
-```
-
-`run_with_csv.py` 会从 `22000000to22249999_BlockTransaction/22000000to22249999_BlockTransaction.csv` 流式读 epoch，做聚合后经 adapter 得到 `AEROState` 并打印 reward。**前提**：CSV 按 `blockNumber` 递增（或至少同一 block 内连续），否则需先按块排序再喂给 `stream_epochs`。
+---
 
 ## 目录结构
 
@@ -77,15 +154,21 @@ drl_account_migration/
 │   └── __init__.py
 ├── aero/
 │   ├── data_adapter.py      # RawEpochStats -> AEROState（唯一与 data 的耦合点）
-│   ├── config.py, state.py, action.py, reward.py, env.py, network.py, ppo.py, infer.py
+│   ├── config.py, state.py, action.py, reward.py
+│   ├── env.py               # 仿真环境 AEROEnv
+│   ├── env_csv.py           # CSV 驱动环境 AEROEnvCSV（用于 --csv-path 训练）
+│   ├── network.py, ppo.py, infer.py
 │   └── __init__.py
-├── train.py                 # 训练入口（当前用仿真 env）
-├── run_with_csv.py          # 示例：CSV 流式 -> AERO 输入
+├── train.py                 # 训练入口（仿真或 CSV，支持 --resume / --save-every）
+├── run_with_csv.py          # CSV 流式 -> 状态/reward（可选 checkpoint、保存/恢复进度）
 ├── requirements.txt
 └── README_AERO_DRL.md
 ```
 
+---
+
 ## 注意事项
 
-- 当前 `AEROEnv._step_transition` 为简单仿真（在 CST/IST 上加噪声和启发式调整），仅用于验证 DRL 训练流程。
+- **仿真模式**（无 `--csv-path`）：`AEROEnv._step_transition` 为简单仿真（在 CST/IST 上加噪声和启发式），仅用于验证 DRL 流程。
+- **CSV 模式**（`--csv-path`）：状态与奖励来自真实交易聚合，CSV 读完后会自动从头再流式读，直到跑满 `--total-steps`。
 - 真实效果需在接入 BlockEmulator 后，用真实交易数据与论文中的实验设置（如 16 shards、100 blocks/epoch、Ethereum 数据）复现。
