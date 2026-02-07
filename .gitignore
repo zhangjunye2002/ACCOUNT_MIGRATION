@@ -1,0 +1,31 @@
+# 训练产物：checkpoint、日志
+checkpoints/
+*.pt
+*.pth
+logs/
+runs/
+
+# CSV 数据（体积大，不提交）
+*.csv
+22000000to22249999_BlockTransaction/*.csv
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 环境与本地配置
+.env
+.env.local
+*.local
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

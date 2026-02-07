@@ -1,0 +1,3 @@
+# AERO DRL dependencies (paper Section 5.1: Python, CleanRL-style)
+numpy>=1.21
+torch>=1.12
