@@ -1,29 +1,141 @@
 """
-Training script for AERO DRL (standalone).
+Training script for AERO DRL (CSV-only).
 
 Usage:
-  python train.py [--total-steps 100000] [--batch-size 128] [--seed 0]
+  python train.py --csv-path <path_to_BlockTransaction.csv> [--total-steps ...]
 
-When integrating with BlockEmulator, replace AEROEnv with an adapter that
-feeds state/action to the emulator and returns next_state, reward from the
-emulator.
+本脚本仅保留基于真实 CSV 的训练流程，不再支持模拟环境训练分支。
 """
 
 import argparse
 import numpy as np
 import torch
 from pathlib import Path
+from typing import Optional
 
 from aero.config import AEROConfig
-from aero.env import AEROEnv
 from aero.env_csv import AEROEnvCSV
 from aero.network import AEROPolicyValueNet
 from aero.ppo import autoregressive_sample, ppo_update
-from aero.state import AEROState
+
+
+def save_csv_state(path: Path, prefix_to_shard: list, prev, block_end: int, epoch_count: int) -> None:
+    """Save dryrun progress so run can be resumed."""
+    np.savez(
+        path,
+        prefix_to_shard=np.array(prefix_to_shard),
+        block_end=np.int64(block_end),
+        epoch_count=np.int64(epoch_count),
+        **(
+            {
+                "cst_per_shard": np.array(prev.cst_per_shard),
+                "ist_per_shard": np.array(prev.ist_per_shard),
+                "txc": np.array(prev.txc),
+                "txi": np.array(prev.txi),
+                "prev_block_start": np.int64(prev.block_start),
+                "prev_block_end": np.int64(prev.block_end),
+            }
+            if prev is not None
+            else {}
+        ),
+    )
+
+
+def load_csv_state(path: Path, RawEpochStats):
+    """Load dryrun progress."""
+    d = np.load(path, allow_pickle=False)
+    prefix_to_shard = d["prefix_to_shard"].tolist()
+    block_end = int(d["block_end"])
+    epoch_count = int(d["epoch_count"])
+    if "cst_per_shard" in d:
+        prev = RawEpochStats(
+            block_start=int(d["prev_block_start"]),
+            block_end=int(d["prev_block_end"]),
+            cst_per_shard=d["cst_per_shard"].tolist(),
+            ist_per_shard=d["ist_per_shard"].tolist(),
+            txc=d["txc"].tolist(),
+            txi=d["txi"].tolist(),
+        )
+    else:
+        prev = None
+    return prefix_to_shard, prev, block_end, epoch_count
+
+
+def run_dryrun(args):
+    """
+    Dryrun mode: stream CSV -> aggregate -> build state -> print reward.
+    No PPO updates, no model parameter changes.
+    """
+    from data import stream_epochs, aggregate_epoch, RawEpochStats
+    from aero.data_adapter import raw_stats_to_aero_state
+    from aero.reward import reward_from_state
+
+    csv_path = Path(args.csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+
+    config = AEROConfig()
+    N, P = config.num_shards, config.num_prefixes
+    blocks_per_epoch = args.blocks_per_epoch
+
+    if args.resume_state:
+        resume_path = Path(args.resume_state)
+        if resume_path.exists():
+            prefix_to_shard, prev, resume_after_block, epoch_start = load_csv_state(resume_path, RawEpochStats)
+            print(f"Resumed from {resume_path} (after block {resume_after_block}, epoch count {epoch_start})")
+        else:
+            print(f"Resume state not found: {resume_path}, starting from scratch")
+            rng = np.random.default_rng(args.seed)
+            prefix_to_shard = (rng.integers(0, N, size=P)).tolist()
+            prev = None
+            resume_after_block = -1
+            epoch_start = 0
+    else:
+        rng = np.random.default_rng(args.seed)
+        prefix_to_shard = (rng.integers(0, N, size=P)).tolist()
+        prev = None
+        resume_after_block = -1
+        epoch_start = 0
+
+    epoch_count = epoch_start
+    last_batch_end = resume_after_block
+    for batch in stream_epochs(csv_path, blocks_per_epoch=blocks_per_epoch):
+        if batch.block_end <= resume_after_block:
+            continue
+        last_batch_end = batch.block_end
+
+        stats = aggregate_epoch(
+            batch,
+            prefix_to_shard=prefix_to_shard,
+            num_shards=N,
+            num_prefixes=P,
+            prefix_bits=config.prefix_bits,
+        )
+        state = raw_stats_to_aero_state(stats, num_shards=N, num_prefixes=P, prev=prev)
+        r = reward_from_state(state, w1=config.w1, w2=config.w2, v_scale=config.reward_v_scale)
+        print(
+            f"epoch blocks [{batch.block_start},{batch.block_end}] "
+            f"txs={len(batch.transactions)} reward={r:.6f} state_dim={state.to_vector().shape[0]}"
+        )
+        prev = stats
+        epoch_count += 1
+
+        if args.save_state and (epoch_count % args.save_state_every == 0):
+            save_csv_state(Path(args.save_state), prefix_to_shard, prev, batch.block_end, epoch_count)
+            print(f"  Saved state to {args.save_state} (block_end={batch.block_end})")
+
+        if args.max_epochs is not None and epoch_count >= args.max_epochs:
+            print(f"(Reached max_epochs={args.max_epochs})")
+            break
+
+    if args.save_state and prev is not None and last_batch_end >= 0:
+        save_csv_state(Path(args.save_state), prefix_to_shard, prev, last_batch_end, epoch_count)
+        print(f"Final state saved to {args.save_state}")
 
 
 def run():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", type=str, choices=["train", "dryrun"], default="train", help="train=CSV PPO training, dryrun=stream CSV and compute reward only")
     parser.add_argument("--total-steps", type=int, default=50_000)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=0)
@@ -32,9 +144,17 @@ def run():
     parser.add_argument("--device", type=str, default=None, help="Override device: 'cuda', 'cpu', or leave empty for auto (GPU if available)")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint path (e.g. checkpoints/aero_5000.pt)")
     parser.add_argument("--save-every", type=int, default=2500, help="Save checkpoint every N steps (default 2500)")
-    parser.add_argument("--csv-path", type=str, default=None, help="Use CSV data for training (e.g. 22000000to22249999_BlockTransaction/22000000to22249999_BlockTransaction.csv)")
+    parser.add_argument("--csv-path", type=str, required=True, help="CSV data for training (e.g. 22000000to22249999_BlockTransaction/22000000to22249999_BlockTransaction.csv)")
     parser.add_argument("--blocks-per-epoch", type=int, default=100, help="Blocks per epoch when using CSV (default 100)")
+    parser.add_argument("--save-state", type=str, default=None, help="(dryrun) Save stream progress to npz")
+    parser.add_argument("--save-state-every", type=int, default=10, help="(dryrun) Save state every N epochs")
+    parser.add_argument("--resume-state", type=str, default=None, help="(dryrun) Resume from saved state npz")
+    parser.add_argument("--max-epochs", type=int, default=None, help="(dryrun) Stop after this many epochs")
     args = parser.parse_args()
+
+    if args.mode == "dryrun":
+        run_dryrun(args)
+        return
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -43,14 +163,11 @@ def run():
     config.batch_size = args.batch_size
     config.log_interval = args.log_interval
 
-    if args.csv_path:
-        csv_path = Path(args.csv_path)
-        if not csv_path.exists():
-            raise FileNotFoundError(f"CSV not found: {csv_path}")
-        env = AEROEnvCSV(config, csv_path, blocks_per_epoch=args.blocks_per_epoch, seed=args.seed)
-        print(f"Training with CSV data: {csv_path} (blocks_per_epoch={args.blocks_per_epoch})")
-    else:
-        env = AEROEnv(config, seed=args.seed)
+    csv_path = Path(args.csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+    env = AEROEnvCSV(config, csv_path, blocks_per_epoch=args.blocks_per_epoch, seed=args.seed)
+    print(f"Training with CSV data: {csv_path} (blocks_per_epoch={args.blocks_per_epoch})")
     s0, _ = env.reset()
     state_dim = s0.to_vector().shape[0]
     if args.device is not None:
@@ -83,27 +200,9 @@ def run():
                 config.total_timesteps = args.total_steps
                 config.batch_size = args.batch_size
             global_step = ckpt.get("global_step", 0)
-            if not args.csv_path and "state_vec" in ckpt and "action_history" in ckpt:
-                next_state = AEROState.from_vector(
-                    ckpt["state_vec"],
-                    ckpt["CST_per_shard"],
-                    ckpt["IST_per_shard"],
-                    N, P,
-                )
-                ah = ckpt["action_history"]
-                if ah.ndim == 2:
-                    action_history = np.asarray(ah, dtype=np.float32).reshape(1, L, 3)
-                else:
-                    action_history = np.asarray(ah, dtype=np.float32)
-                if "prefix_to_shard" in ckpt and "epoch" in ckpt and "env_action_history" in ckpt:
-                    env.set_state(
-                        ckpt["prefix_to_shard"],
-                        int(ckpt["epoch"]),
-                        [tuple(x) for x in ckpt["env_action_history"]],
-                    )
-            elif args.csv_path:
-                next_state, _ = env.reset()
-                action_history = np.asarray(env.get_action_history_for_policy(), dtype=np.float32).reshape(1, L, 3)
+            # CSV 流位置无法严格恢复；resume 时仅恢复网络参数/步数，环境从 CSV 头重置继续
+            next_state, _ = env.reset()
+            action_history = np.asarray(env.get_action_history_for_policy(), dtype=np.float32).reshape(1, L, 3)
             print(f"Resumed from {ckpt_path} at step {global_step}")
         else:
             print(f"Resume path not found: {ckpt_path}, starting from scratch")
@@ -122,9 +221,11 @@ def run():
             dones_buf = []
 
             for _ in range(config.batch_size):
+                # 记录“执行动作前”的 history，供 PPO 重算 log_prob 时使用
+                action_history_before = action_history.copy()
                 state_vec = next_state.to_vector()
                 st = torch.tensor(state_vec, dtype=torch.float32, device=device).unsqueeze(0)
-                ah = torch.tensor(action_history, dtype=torch.float32, device=device)
+                ah = torch.tensor(action_history_before, dtype=torch.float32, device=device)
                 with torch.no_grad():
                     actions, log_prob = autoregressive_sample(
                         net, st, ah, K, N, P
@@ -139,7 +240,7 @@ def run():
                         action_history[0, L - nh + i, :] = m
 
                 states_buf.append(state_vec)
-                action_hist_buf.append(action_history[0])
+                action_hist_buf.append(action_history_before[0])
                 action_seqs_buf.append(act_np)
                 old_log_probs_buf.append(log_prob[0].item())
                 rewards_buf.append(reward)
