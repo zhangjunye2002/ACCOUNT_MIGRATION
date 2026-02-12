@@ -199,6 +199,10 @@ def run():
                 config = ckpt["config"]
                 config.total_timesteps = args.total_steps
                 config.batch_size = args.batch_size
+                # 关键修复：resume 后 config 可能变化，需同步重算依赖变量
+                L = config.action_history_len
+                K = config.max_migrations_per_epoch
+                N, P = config.num_shards, config.num_prefixes
             global_step = ckpt.get("global_step", 0)
             # CSV 流位置无法严格恢复；resume 时仅恢复网络参数/步数，环境从 CSV 头重置继续
             next_state, _ = env.reset()

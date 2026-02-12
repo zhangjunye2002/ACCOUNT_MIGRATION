@@ -194,7 +194,12 @@ def main():
 
         # 2) 转成 AEROState，计算 reward / u_t / v_t
         state = raw_stats_to_aero_state(stats, num_shards=N, num_prefixes=P, prev=prev_stats)
-        R = reward_from_state(state, w1=config.w1, w2=config.w2)
+        R = reward_from_state(
+            state,
+            w1=config.w1,
+            w2=config.w2,
+            v_scale=config.reward_v_scale,
+        )
         u_t, v_t = compute_u_v(state)
 
         print(
