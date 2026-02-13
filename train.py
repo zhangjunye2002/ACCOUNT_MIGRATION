@@ -2,7 +2,7 @@
 Training script for AERO DRL (CSV-only).
 
 Usage:
-  python train.py --csv-path <path_to_BlockTransaction.csv> [--total-steps ...]
+  python train.py --csv-path <path_to_BlockTransaction.csv> [--txs-per-epoch 10000] [--total-steps ...]
 
 本脚本仅保留基于真实 CSV 的训练流程，不再支持模拟环境训练分支。
 """
@@ -77,6 +77,7 @@ def run_dryrun(args):
     config = AEROConfig()
     N, P = config.num_shards, config.num_prefixes
     blocks_per_epoch = args.blocks_per_epoch
+    txs_per_epoch = args.txs_per_epoch
 
     if args.resume_state:
         resume_path = Path(args.resume_state)
@@ -99,7 +100,11 @@ def run_dryrun(args):
 
     epoch_count = epoch_start
     last_batch_end = resume_after_block
-    for batch in stream_epochs(csv_path, blocks_per_epoch=blocks_per_epoch):
+    for batch in stream_epochs(
+        csv_path,
+        blocks_per_epoch=blocks_per_epoch,
+        txs_per_epoch=txs_per_epoch,
+    ):
         if batch.block_end <= resume_after_block:
             continue
         last_batch_end = batch.block_end
@@ -143,14 +148,30 @@ def run():
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--device", type=str, default=None, help="Override device: 'cuda', 'cpu', or leave empty for auto (GPU if available)")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint path (e.g. checkpoints/aero_5000.pt)")
-    parser.add_argument("--save-every", type=int, default=2500, help="Save checkpoint every N steps (default 2500)")
+    parser.add_argument("--save-every", type=int, default=256, help="Save checkpoint every N steps (default 256)")
     parser.add_argument("--csv-path", type=str, required=True, help="CSV data for training (e.g. 22000000to22249999_BlockTransaction/22000000to22249999_BlockTransaction.csv)")
-    parser.add_argument("--blocks-per-epoch", type=int, default=100, help="Blocks per epoch when using CSV (default 100)")
+    epoch_group = parser.add_mutually_exclusive_group()
+    epoch_group.add_argument(
+        "--blocks-per-epoch",
+        type=int,
+        default=None,
+        help="(兼容模式) Blocks per epoch when using CSV",
+    )
+    epoch_group.add_argument(
+        "--txs-per-epoch",
+        type=int,
+        default=None,
+        help="Transactions per epoch when using CSV (recommended)",
+    )
     parser.add_argument("--save-state", type=str, default=None, help="(dryrun) Save stream progress to npz")
     parser.add_argument("--save-state-every", type=int, default=10, help="(dryrun) Save state every N epochs")
     parser.add_argument("--resume-state", type=str, default=None, help="(dryrun) Resume from saved state npz")
     parser.add_argument("--max-epochs", type=int, default=None, help="(dryrun) Stop after this many epochs")
     args = parser.parse_args()
+    if args.blocks_per_epoch is None and args.txs_per_epoch is None:
+        # 默认采用按交易条数切分，保证每个 epoch 样本规模更稳定
+        # 论文设定 100 blocks/epoch，Ethereum 每 block 约 100~200 tx，对应 ~10K~20K tx
+        args.txs_per_epoch = 10000
 
     if args.mode == "dryrun":
         run_dryrun(args)
@@ -166,8 +187,18 @@ def run():
     csv_path = Path(args.csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
-    env = AEROEnvCSV(config, csv_path, blocks_per_epoch=args.blocks_per_epoch, seed=args.seed)
-    print(f"Training with CSV data: {csv_path} (blocks_per_epoch={args.blocks_per_epoch})")
+    env = AEROEnvCSV(
+        config,
+        csv_path,
+        blocks_per_epoch=args.blocks_per_epoch,
+        txs_per_epoch=args.txs_per_epoch,
+        seed=args.seed,
+    )
+    if args.txs_per_epoch is not None:
+        epoch_desc = f"txs_per_epoch={args.txs_per_epoch}"
+    else:
+        epoch_desc = f"blocks_per_epoch={args.blocks_per_epoch}"
+    print(f"Training with CSV data: {csv_path} ({epoch_desc})")
     s0, _ = env.reset()
     state_dim = s0.to_vector().shape[0]
     if args.device is not None:
@@ -187,6 +218,7 @@ def run():
 
     Path(args.save_dir).mkdir(parents=True, exist_ok=True)
     global_step = 0
+    next_save_step = args.save_every
     next_state = s0
     action_history = np.asarray(env.get_action_history_for_policy(), dtype=np.float32).reshape(1, L, 3)
 
@@ -194,20 +226,25 @@ def run():
         ckpt_path = Path(args.resume)
         if ckpt_path.exists():
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-            net.load_state_dict(ckpt["net"])
-            if "config" in ckpt:
-                config = ckpt["config"]
-                config.total_timesteps = args.total_steps
-                config.batch_size = args.batch_size
-                # 关键修复：resume 后 config 可能变化，需同步重算依赖变量
-                L = config.action_history_len
-                K = config.max_migrations_per_epoch
-                N, P = config.num_shards, config.num_prefixes
-            global_step = ckpt.get("global_step", 0)
-            # CSV 流位置无法严格恢复；resume 时仅恢复网络参数/步数，环境从 CSV 头重置继续
-            next_state, _ = env.reset()
-            action_history = np.asarray(env.get_action_history_for_policy(), dtype=np.float32).reshape(1, L, 3)
-            print(f"Resumed from {ckpt_path} at step {global_step}")
+            try:
+                net.load_state_dict(ckpt["net"])
+                if "config" in ckpt:
+                    config = ckpt["config"]
+                    config.total_timesteps = args.total_steps
+                    config.batch_size = args.batch_size
+                    L = config.action_history_len
+                    K = config.max_migrations_per_epoch
+                    N, P = config.num_shards, config.num_prefixes
+                global_step = ckpt.get("global_step", 0)
+                # resume 后同步下一次保存阈值
+                next_save_step = ((global_step // args.save_every) + 1) * args.save_every
+                # CSV 流位置无法严格恢复；resume 时仅恢复网络参数/步数，环境从 CSV 头重置继续
+                next_state, _ = env.reset()
+                action_history = np.asarray(env.get_action_history_for_policy(), dtype=np.float32).reshape(1, L, 3)
+                print(f"Resumed from {ckpt_path} at step {global_step}")
+            except RuntimeError as e:
+                print(f"[WARN] Checkpoint 架构不兼容（可能是旧版 Gaussian 模型）: {e}")
+                print("将使用随机初始化参数，从 step 0 开始训练。")
         else:
             print(f"Resume path not found: {ckpt_path}, starting from scratch")
 
@@ -278,8 +315,9 @@ def run():
                     f"step {global_step} | reward_mean={rewards.mean():.4f} | "
                     f"policy_loss={metrics['policy_loss']:.4f} value_loss={metrics['value_loss']:.4f}"
                 )
-            if global_step > 0 and global_step % args.save_every == 0:
-                p = Path(args.save_dir) / f"aero_{global_step}.pt"
+            # 用阈值触发，而不是“恰好整除”，避免 batch 粒度导致长期不保存
+            while global_step >= next_save_step:
+                p = Path(args.save_dir) / f"aero_{next_save_step}.pt"
                 save_dict = {
                     "net": net.state_dict(),
                     "config": config,
@@ -294,6 +332,7 @@ def run():
                 }
                 torch.save(save_dict, p)
                 print(f"Saved {p}")
+                next_save_step += args.save_every
 
         print("Training done.")
         save_dict = {

@@ -28,17 +28,14 @@ def compute_reward(
     N: int = None,
 ) -> float:
     """
-    R_t = w1 * u_t + w2 * v_t
+    R_t = w1 * (1 - u_t) + w2 * v_t
 
-    - u_t = c_t / (b_t + c_t)
-      c_t = (1/N) * sum_i CST_i
-      b_t = (1/N) * sum_i IST_i
-    - v_t = - (1/N) * sum_i (CST_i - c_t)^2  [negative variance of CST per shard]
+    - u_t = c_t / (b_t + c_t): 跨片交易占比（CSTX ratio），越低越好
+    - v_t = -(1/N) * sum_i (CST_i - c_t)^2: 负方差，越接近 0 越好
 
-    Maximizing R encourages: lower CSTX ratio (smaller u_t) and more balanced CST (smaller variance).
-    So we want u_t small and variance small -> u_t is "CSTX ratio" so lower is better.
-    Paper says "By maximizing R_t, the agent is encouraged to reduce u_t and minimize v_t".
-    Here v_t is already negative variance, so maximizing v_t means minimizing variance.
+    最大化 R → 降低 u_t（跨片比例） + 最小化方差 → 分片更均衡。
+    注意：u_t 是 CSTX ratio，我们用 (1-u_t) 使方向一致，
+    即"最大化 R ↔ 降低跨片比例"。
     """
     CST = np.asarray(CST_per_shard, dtype=np.float64)
     IST = np.asarray(IST_per_shard, dtype=np.float64)
@@ -60,8 +57,9 @@ def compute_reward(
     var_cst = np.mean((CST - c_t) ** 2)
     v_t = -var_cst
 
-    # 对 v_t 做缩放，避免其绝对值远大于 u_t，导致学习信号被完全淹没
-    return float(w1 * u_t + w2 * (v_scale * v_t))
+    # 修正奖励方向：用 (1-u_t) 使「最大化 R ↔ 降低跨片比例」
+    # v_t 缩放避免量级差异过大；可按数据集调整 v_scale: 1e-6 ~ 1e-4
+    return float(w1 * (1.0 - u_t) + w2 * (v_scale * v_t))
 
 
 def reward_from_state(

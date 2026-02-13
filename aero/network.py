@@ -1,14 +1,15 @@
 """
 基于注意力机制的策略 + 价值网络（对应论文 Appendix C, 式 (14)–(17)）。
 
-可以把它理解成一件事：
-- 输入：当前状态 s_t + 最近若干轮的迁移历史 a_{t-1}, a_{t-2}, ...；
-- 通过 Multi-Head Attention，把「当前形势」和「历史行为模式」融合成一个上下文向量 h；
-- 再由一个小 MLP 输出「本轮下一个迁移」的动作分布（src shard, tgt shard, prefix）。
+--- 关键设计 ---
+动作空间改为「离散 Categorical」：
+  - src_shard / tgt_shard: 各 Categorical(num_shards)
+  - prefix: Categorical(num_prefixes)
 
-相比简单 MLP，这种结构更容易捕捉：
-- 某些 prefix 之前经常被迁移到哪些 shard；
-- 某种迁移模式之后，系统的 CST/负载会如何变化。
+之前用连续 Gaussian + round 的方式：
+  - 16 个分片的 Gaussian 还勉强可用（std=1 覆盖 ~5 个值）；
+  - 但 256 个前缀时 Gaussian 只能覆盖中心附近极少数值 → 严重的"前缀塌缩"。
+改用 Categorical 后，每个 prefix 都有独立 logit，不受 Gaussian 覆盖范围限制。
 """
 
 import numpy as np
@@ -31,7 +32,6 @@ class ActionHistoryEncoder(nn.Module):
 
     def __init__(self, d_model: int, num_shards: int, num_prefixes: int):
         super().__init__()
-        # Each action (src, tgt, prefix): normalize to embeddings
         self.d_model = d_model
         # 每个分量用 d_model//3 维，拼接后为 3*(d_model//3)，可能 < d_model（如 256→255）
         self._emb_dim = d_model // 3
@@ -58,18 +58,11 @@ class ActionHistoryEncoder(nn.Module):
 
 class AEROAttentionPolicy(nn.Module):
     """
-    策略网络： (状态 s + 动作历史) -> 上下文 h -> 动作分布。
+    策略网络：(状态 s + 动作历史) -> 上下文 h -> 离散动作分布。
 
-    对应论文 Appendix C 的描述：
-    - Q（query）来自当前状态 s；
-    - K/V（key/value）来自历史动作编码 H_enc；
-    - Multi-Head Attention 计算出若干个 head 的输出，再拼接成 h；
-    - 用 W_out h + b_out 得到一个 3 维的动作向量，表示 (src, tgt, prefix) 的「均值」。
-
-    在 PPO 里我们把它当作高斯策略：
-    - action_mean: h 经过 MLP 的输出；
-    - log_std: 额外学习到的对数标准差（全局 3 维）；
-    - 采样时：Normal(action_mean, std)。
+    Q (query) 来自状态 s，K/V 来自历史动作编码 H_enc，
+    Multi-Head Attention 融合后得到上下文 h，
+    再通过三个独立的线性头输出 src / tgt / prefix 的 Categorical logits。
     """
 
     def __init__(self, config: AEROConfig, state_dim: int):
@@ -83,27 +76,31 @@ class AEROAttentionPolicy(nn.Module):
         N = config.num_shards
         P = config.num_prefixes
 
+        # ---- 状态编码 ----
         self.state_encoder = nn.Sequential(
             nn.Linear(state_dim, config.num_neurons),
             nn.ReLU(),
             nn.Linear(config.num_neurons, d_model),
         )
+        # ---- 动作历史编码 ----
         self.action_encoder = ActionHistoryEncoder(d_model, N, P)
 
-        # Q from state: per head W_qi (d_h, d_model) — we use state encoded to d_model
-        self.W_q = nn.Linear(d_model, self.d_h * self.num_heads)  # state -> all Qs
-        # K, V from Henc: (L, d_model) -> (L, d_h) per head
+        # ---- Multi-Head Attention ----
+        # Q from state, K/V from action history
+        self.W_q = nn.Linear(d_model, self.d_h * self.num_heads)
         self.W_k = nn.Linear(d_model, self.d_h * self.num_heads)
         self.W_v = nn.Linear(d_model, self.d_h * self.num_heads)
         self.W_O = nn.Linear(self.num_heads * self.d_h, d_model)
 
-        # Decoder: h -> action (src, tgt, prefix) as continuous R^3; PPO will use Gaussian policy
-        self.action_head = nn.Sequential(
+        # ---- 离散 Categorical 动作头 ----
+        # 共享隐藏层 → 三个独立 logits 分支
+        self.action_hidden = nn.Sequential(
             nn.Linear(d_model, config.num_neurons),
             nn.ReLU(),
-            nn.Linear(config.num_neurons, 3),
         )
-        self.log_std_head = nn.Parameter(torch.zeros(3))
+        self.src_head = nn.Linear(config.num_neurons, N)    # → Categorical(N)
+        self.tgt_head = nn.Linear(config.num_neurons, N)    # → Categorical(N)
+        self.prefix_head = nn.Linear(config.num_neurons, P) # → Categorical(P)
 
     def _context(self, state_vec: torch.Tensor, action_history: torch.Tensor) -> torch.Tensor:
         """
@@ -125,20 +122,24 @@ class AEROAttentionPolicy(nn.Module):
         h_cat = head_out.reshape(B, -1)  # (B, H*d_h)
         return self.W_O(h_cat)  # (B, d_model)
 
+    def _logits_from_context(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """从上下文 h 计算三个动作维度的 logits。"""
+        a_h = self.action_hidden(h)
+        return self.src_head(a_h), self.tgt_head(a_h), self.prefix_head(a_h)
+
     def forward(
         self,
         state_vec: torch.Tensor,
         action_history: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Returns action_mean (B, 3), log_std (3) for Gaussian policy.
-        action in R^3 will be interpreted as (src_shard, tgt_shard, prefix) after scaling.
+        Returns (src_logits, tgt_logits, prefix_logits).
+        - src_logits:    (B, num_shards)
+        - tgt_logits:    (B, num_shards)
+        - prefix_logits: (B, num_prefixes)
         """
         h = self._context(state_vec, action_history)
-        action_mean = self.action_head(h)  # (B, 3)
-        log_std = self.log_std_head.clamp(-20, 2)
-        return action_mean, log_std
-
+        return self._logits_from_context(h)
 
 
 class AEROPolicyValueNet(nn.Module):
@@ -156,11 +157,15 @@ class AEROPolicyValueNet(nn.Module):
         self,
         state_vec: torch.Tensor,
         action_history: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        action_mean, log_std = self.policy_net(state_vec, action_history)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns (src_logits, tgt_logits, prefix_logits, value).
+        只计算一次 _context，同时用于策略和价值。
+        """
         h = self.policy_net._context(state_vec, action_history)
+        src_l, tgt_l, pref_l = self.policy_net._logits_from_context(h)
         value = self.value_head(h).squeeze(-1)
-        return action_mean, log_std, value
+        return src_l, tgt_l, pref_l, value
 
     def get_action_and_value(
         self,
@@ -168,11 +173,28 @@ class AEROPolicyValueNet(nn.Module):
         action_history: torch.Tensor,
         action: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        action_mean, log_std, value = self.forward(state_vec, action_history)
-        std = log_std.exp()
-        dist = torch.distributions.Normal(action_mean, std)
+        """
+        采样/评估一条离散动作 (src, tgt, prefix)。
+        action: (B, 3) float tensor（值为离散索引）; None 则采样。
+        Returns (action, log_prob, entropy, value).
+        """
+        src_l, tgt_l, pref_l, value = self.forward(state_vec, action_history)
+        src_dist = torch.distributions.Categorical(logits=src_l)
+        tgt_dist = torch.distributions.Categorical(logits=tgt_l)
+        prefix_dist = torch.distributions.Categorical(logits=pref_l)
         if action is None:
-            action = dist.sample()
-        log_prob = dist.log_prob(action).sum(dim=-1)
-        entropy = dist.entropy().sum(dim=-1)
+            src = src_dist.sample()
+            tgt = tgt_dist.sample()
+            pref = prefix_dist.sample()
+            action = torch.stack([src, tgt, pref], dim=-1).float()
+        else:
+            src = action[..., 0].long()
+            tgt = action[..., 1].long()
+            pref = action[..., 2].long()
+        log_prob = (src_dist.log_prob(src)
+                    + tgt_dist.log_prob(tgt)
+                    + prefix_dist.log_prob(pref))
+        entropy = (src_dist.entropy()
+                   + tgt_dist.entropy()
+                   + prefix_dist.entropy())
         return action, log_prob, entropy, value

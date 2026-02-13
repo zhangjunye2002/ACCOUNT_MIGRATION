@@ -40,6 +40,8 @@ class AEROConfig:
     # 价值函数损失的权重
     value_coef: float = 0.5
     # 熵正则系数：越大越鼓励「多探索」
+    # Categorical 分布下单步最大熵 ≈ ln(N)+ln(N)+ln(P) ≈ 11；
+    # 0.01~0.05 范围内可调
     entropy_coef: float = 0.01
     # 梯度裁剪阈值，防止训练不稳定
     max_grad_norm: float = 0.5

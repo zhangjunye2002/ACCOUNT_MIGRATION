@@ -35,10 +35,13 @@ def load_aero(checkpoint_path: str, device: Optional[str] = None) -> tuple:
     s0 = AEROState.dummy(config.num_shards, config.num_prefixes)
     state_dim = s0.to_vector().shape[0]
     net = AEROPolicyValueNet(config, state_dim).to(device)
-    if "net" in ckpt:
+    try:
         net.load_state_dict(state_dict)
-    else:
-        net.load_state_dict(state_dict)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Checkpoint 与当前模型架构不兼容（可能是旧版 Gaussian 模型）。"
+            f"请用新版代码重新训练。\n错误详情: {e}"
+        ) from e
     return net, config
 
 
@@ -84,15 +87,16 @@ def get_migration_plan(
     h = ah
     with torch.no_grad():
         for _ in range(K):
-            action_mean, log_std, _ = net(st, h)
+            # 网络输出三组 Categorical logits
+            src_logits, tgt_logits, prefix_logits, _ = net(st, h)
             if deterministic:
-                a = action_mean[0].cpu().numpy()
+                src = src_logits.argmax(dim=-1).item()
+                tgt = tgt_logits.argmax(dim=-1).item()
+                pref = prefix_logits.argmax(dim=-1).item()
             else:
-                std = log_std.exp()
-                a = (action_mean + torch.randn_like(action_mean, device=device) * std)[0].cpu().numpy()
-            src = int(np.clip(np.round(a[0]), 0, N - 1))
-            tgt = int(np.clip(np.round(a[1]), 0, N - 1))
-            pref = int(np.clip(np.round(a[2]), 0, P - 1))
+                src = torch.distributions.Categorical(logits=src_logits).sample().item()
+                tgt = torch.distributions.Categorical(logits=tgt_logits).sample().item()
+                pref = torch.distributions.Categorical(logits=prefix_logits).sample().item()
             if src != tgt:
                 migrations.append(MigrationTransaction(sender_shard=src, receiver_shard=tgt, prefix=pref))
             # Update history

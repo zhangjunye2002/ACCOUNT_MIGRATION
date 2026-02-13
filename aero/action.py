@@ -49,3 +49,33 @@ def action_to_migrations(action_tensor: np.ndarray) -> List[MigrationTransaction
 def migrations_to_action_list(migrations: List[MigrationTransaction]) -> List[Tuple[int, int, int]]:
     """List of (sender, receiver, prefix) for encoding as action history."""
     return [m.to_tuple() for m in migrations]
+
+
+def dedup_migrations(
+    plan: List[MigrationTransaction],
+    num_shards: int,
+    num_prefixes: int,
+) -> List[MigrationTransaction]:
+    """
+    同一 epoch 内按 prefix 去重：保留每个 prefix 的最后一条有效迁移。
+
+    过滤规则：
+    - sender_shard == receiver_shard（无效：原地不动）
+    - prefix / shard 越界
+    - 同一 prefix 出现多次时只保留最后一条（避免互相冲突 / 回滚）
+    """
+    seen: set = set()
+    out: List[MigrationTransaction] = []
+    for m in reversed(plan):
+        if not (0 <= m.prefix < num_prefixes):
+            continue
+        if not (0 <= m.sender_shard < num_shards and 0 <= m.receiver_shard < num_shards):
+            continue
+        if m.sender_shard == m.receiver_shard:
+            continue
+        if m.prefix in seen:
+            continue
+        seen.add(m.prefix)
+        out.append(m)
+    out.reverse()
+    return out

@@ -9,11 +9,11 @@ CSV 读完后 truncated=True，训练脚本会 reset 并从 CSV 头重新开始�
 
 import numpy as np
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .config import AEROConfig
 from .state import AEROState
-from .action import MigrationTransaction
+from .action import MigrationTransaction, dedup_migrations
 from .data_adapter import raw_stats_to_aero_state
 from .reward import reward_from_state
 
@@ -43,7 +43,8 @@ class AEROEnvCSV:
         config: AEROConfig,
         csv_path: Union[str, Path],
         *,
-        blocks_per_epoch: int = 100,
+        blocks_per_epoch: Optional[int] = None,
+        txs_per_epoch: Optional[int] = 10000,
         seed: int = 0,
     ):
         self.config = config
@@ -52,6 +53,7 @@ class AEROEnvCSV:
         self.max_migrations = config.max_migrations_per_epoch
         self.csv_path = Path(csv_path)
         self.blocks_per_epoch = blocks_per_epoch
+        self.txs_per_epoch = txs_per_epoch
         self.rng = np.random.default_rng(seed)
         self._prefix_to_shard: np.ndarray = np.zeros(config.num_prefixes, dtype=np.int32)
         self._epoch = 0
@@ -77,7 +79,13 @@ class AEROEnvCSV:
         """初始化 CSV 迭代器，并可跳过到指定 block 之后。"""
         from data import stream_epochs
 
-        self._iterator = iter(stream_epochs(self.csv_path, blocks_per_epoch=self.blocks_per_epoch))
+        self._iterator = iter(
+            stream_epochs(
+                self.csv_path,
+                blocks_per_epoch=self.blocks_per_epoch,
+                txs_per_epoch=self.txs_per_epoch,
+            )
+        )
         self._pending_batch = None
         if start_after_block is None:
             return
@@ -133,17 +141,22 @@ class AEROEnvCSV:
         from data import aggregate_epoch
 
         migrations = _parse_action(action, self.num_shards, self.num_prefixes)
+        # prefix 去重 + 过滤无效迁移（与 eval 语义一致）
+        migrations = dedup_migrations(migrations, self.num_shards, self.num_prefixes)
+        applied = 0
         for m in migrations:
-            if 0 <= m.prefix < self.num_prefixes and 0 <= m.sender_shard < self.num_shards and 0 <= m.receiver_shard < self.num_shards:
-                if self._prefix_to_shard[m.prefix] == m.sender_shard:
-                    self._prefix_to_shard[m.prefix] = m.receiver_shard
+            # 用真实当前映射（而非策略预测的 sender_shard）作为迁移源
+            current_src = int(self._prefix_to_shard[m.prefix])
+            if current_src != m.receiver_shard:
+                self._prefix_to_shard[m.prefix] = m.receiver_shard
+                applied += 1
         self._action_history.extend(m.to_tuple() for m in migrations)
         self._action_history = self._action_history[-self.config.action_history_len :]
         self._epoch += 1
 
         batch = self._next_batch()
         if batch is None:
-            return state, 0.0, False, True, {"epoch": self._epoch, "migrations": len(migrations), "truncated": True}
+            return state, 0.0, False, True, {"epoch": self._epoch, "migrations": len(migrations), "applied": applied, "truncated": True}
 
         next_stats = aggregate_epoch(
             batch,
@@ -165,7 +178,7 @@ class AEROEnvCSV:
             w2=self.config.w2,
             v_scale=self.config.reward_v_scale,
         )
-        info = {"epoch": self._epoch, "migrations": len(migrations), "block_end": batch.block_end}
+        info = {"epoch": self._epoch, "migrations": len(migrations), "applied": applied, "block_end": batch.block_end}
         return next_state, reward, False, False, info
 
     def get_action_history_for_policy(self) -> np.ndarray:

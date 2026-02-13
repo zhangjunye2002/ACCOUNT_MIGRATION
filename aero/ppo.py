@@ -1,10 +1,11 @@
 """
 PPO 训练逻辑（对应论文 Section 4 中「用 PPO 优化策略」的部分）。
 
-你可以把这里理解为「外壳」：
-- 上层代码负责收集一批 (s_t, a_t, r_t) 序列（rollout）；
-- 这里根据这些样本算回报、优势（advantage），
-  再按 PPO 的公式更新策略网络参数。
+--- 关键改动 ---
+动作分布从连续 Gaussian 改为离散 Categorical：
+  - src_shard, tgt_shard: Categorical(num_shards)
+  - prefix: Categorical(num_prefixes)
+自回归函数（sample / log_prob / entropy）相应更新。
 """
 
 import numpy as np
@@ -27,23 +28,23 @@ def autoregressive_log_prob(
     num_prefixes: int,
 ) -> torch.Tensor:
     """
-    计算**整段动作序列**在当前策略下的 log_prob。
+    计算整段动作序列在当前策略下的 log_prob（Categorical 版本）。
 
-    AERO 的一个 epoch 动作 a_t 是一串迁移：
-        a_t = [a^(1), a^(2), ..., a^(K)]
-    这里采用「自回归」的方式：
-    - 第 k 步时，把前 k-1 步的动作作为 history，算 p(a^(k) | s, a^(1..k-1))；
-    - 整段 log_prob 是每一步 log_prob 的求和。
+    action_seq: (B, K, 3)，值为离散索引（整数值的 float）。
     """
     B, K, _ = action_seq.shape
     action_history = init_action_history.clone()
     log_probs = []
     for k in range(K):
-        action_mean, log_std, _ = net(state_vec, action_history)
-        std = log_std.exp()
-        dist = torch.distributions.Normal(action_mean, std)
-        a_k = action_seq[:, k, :]
-        log_probs.append(dist.log_prob(a_k).sum(dim=-1))
+        src_logits, tgt_logits, prefix_logits, _ = net(state_vec, action_history)
+        src_dist = torch.distributions.Categorical(logits=src_logits)
+        tgt_dist = torch.distributions.Categorical(logits=tgt_logits)
+        prefix_dist = torch.distributions.Categorical(logits=prefix_logits)
+        a_k = action_seq[:, k, :]  # (B, 3) float, integer-valued
+        lp = (src_dist.log_prob(a_k[:, 0].long())
+              + tgt_dist.log_prob(a_k[:, 1].long())
+              + prefix_dist.log_prob(a_k[:, 2].long()))
+        log_probs.append(lp)
         # 用当前动作更新 history（滑窗）
         a_clip = a_k.clone()
         a_clip[:, 0] = a_k[:, 0].clamp(0, num_shards - 1)
@@ -61,15 +62,17 @@ def autoregressive_entropy(
     num_shards: int,
     num_prefixes: int,
 ) -> torch.Tensor:
-    """按序列累计策略熵，避免只看首个动作的熵。"""
+    """按序列累计策略熵（Categorical 版本）。"""
     B, K, _ = action_seq.shape
     action_history = init_action_history.clone()
     entropies = []
     for k in range(K):
-        action_mean, log_std, _ = net(state_vec, action_history)
-        std = log_std.exp()
-        dist = torch.distributions.Normal(action_mean, std)
-        entropies.append(dist.entropy().sum(dim=-1))
+        src_logits, tgt_logits, prefix_logits, _ = net(state_vec, action_history)
+        src_dist = torch.distributions.Categorical(logits=src_logits)
+        tgt_dist = torch.distributions.Categorical(logits=tgt_logits)
+        prefix_dist = torch.distributions.Categorical(logits=prefix_logits)
+        ent = src_dist.entropy() + tgt_dist.entropy() + prefix_dist.entropy()
+        entropies.append(ent)
         a_k = action_seq[:, k, :]
         a_clip = a_k.clone()
         a_clip[:, 0] = a_k[:, 0].clamp(0, num_shards - 1)
@@ -88,10 +91,8 @@ def autoregressive_sample(
     num_prefixes: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    自回归地采样一整段迁移序列：
-    - 输入：当前状态向量和「之前若干 epoch 的历史动作」；
-    - 内部循环 K 次，每次用当前 history 调一次策略，采样出下一条迁移；
-    - 同时累加每一步的 log_prob，方便训练时用作 old_log_prob。
+    自回归地采样一整段离散迁移序列。
+    返回 actions (B, K, 3) float tensor（值为离散索引）, log_prob (B,).
     """
     B = state_vec.shape[0]
     device = state_vec.device
@@ -99,21 +100,23 @@ def autoregressive_sample(
     log_probs_list = []
     h = action_history
     for _ in range(max_migrations):
-        action_mean, log_std, _ = net(state_vec, h)
-        std = log_std.exp()
-        dist = torch.distributions.Normal(action_mean, std)
-        a = dist.sample()
-        log_probs_list.append(dist.log_prob(a).sum(dim=-1))
+        src_logits, tgt_logits, prefix_logits, _ = net(state_vec, h)
+        src_dist = torch.distributions.Categorical(logits=src_logits)
+        tgt_dist = torch.distributions.Categorical(logits=tgt_logits)
+        prefix_dist = torch.distributions.Categorical(logits=prefix_logits)
+        src = src_dist.sample()      # (B,) long
+        tgt = tgt_dist.sample()      # (B,) long
+        pref = prefix_dist.sample()  # (B,) long
+        a = torch.stack([src, tgt, pref], dim=-1).float()  # (B, 3)
+        lp = (src_dist.log_prob(src)
+              + tgt_dist.log_prob(tgt)
+              + prefix_dist.log_prob(pref))
+        log_probs_list.append(lp)
         actions_list.append(a)
         # Update history: append and keep last L
-        L = h.shape[1]
-        a_clip = a.clone()
-        a_clip[:, 0] = a[:, 0].clamp(0, num_shards - 1)
-        a_clip[:, 1] = a[:, 1].clamp(0, num_shards - 1)
-        a_clip[:, 2] = a[:, 2].clamp(0, num_prefixes - 1)
-        h = torch.cat([h[:, 1:], a_clip.unsqueeze(1)], dim=1)
-    actions = torch.stack(actions_list, dim=1)
-    log_prob = torch.stack(log_probs_list, dim=1).sum(dim=1)
+        h = torch.cat([h[:, 1:], a.unsqueeze(1)], dim=1)
+    actions = torch.stack(actions_list, dim=1)  # (B, K, 3)
+    log_prob = torch.stack(log_probs_list, dim=1).sum(dim=1)  # (B,)
     return actions, log_prob
 
 
@@ -130,20 +133,13 @@ def ppo_update(
 ) -> dict:
     """
     用一批采样到的轨迹数据做一次 PPO 更新。
-
-    输入数据含义（时间步数记为 T）：
-    - states:           shape (T, state_dim)，每一行是某个 epoch 结束时的状态向量；
-    - action_histories: shape (T, L, 3)，每一步开始时看到的历史迁移窗口；
-    - action_seqs:      shape (T, K, 3)，该步完整迁移序列（自回归生成）；
-    - old_log_probs:    shape (T,)，上一次采样时整段动作的 log_prob；
-    - rewards:          shape (T,)，该步得到的标量奖励；
-    - dones:            shape (T,)，是否 episode 结束（这里一般按固定步数结束）。
+    action_seqs 里的值是离散索引（整数值的 float）。
 
     关键步骤：
     1. 反向累积奖励得到 return（折扣和）；
     2. return - value 得到 advantage，并做标准化；
     3. 重新用当前策略算 log_prob，得到 ratio = exp(new - old)；
-    4. 按 PPO 的 clip 公式计算策略损失，加上价值损失和值熵正则，共同反向传播。
+    4. 按 PPO 的 clip 公式计算策略损失，加上价值损失和熵正则，共同反向传播。
     """
     device = next(net.parameters()).device
     T = states.shape[0]
@@ -156,7 +152,7 @@ def ppo_update(
         returns[t] = g
     st = torch.tensor(states, dtype=torch.float32, device=device)
     ah = torch.tensor(action_histories, dtype=torch.float32, device=device)
-    _, _, values = net(st, ah)
+    _, _, _, values = net(st, ah)
     values_np = values.detach().cpu().numpy()
     adv = returns - values_np
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -177,7 +173,7 @@ def ppo_update(
                 net, sb_st, sb_ah, sb_act,
                 config.num_shards, config.num_prefixes,
             )
-            _, _, new_value = net(sb_st, sb_ah)
+            _, _, _, new_value = net(sb_st, sb_ah)
             seq_entropy = autoregressive_entropy(
                 net, sb_st, sb_ah, sb_act,
                 config.num_shards, config.num_prefixes,
