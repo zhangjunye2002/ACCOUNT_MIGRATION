@@ -36,12 +36,24 @@ def load_aero(checkpoint_path: str, device: Optional[str] = None) -> tuple:
     state_dim = s0.to_vector().shape[0]
     net = AEROPolicyValueNet(config, state_dim).to(device)
     try:
-        net.load_state_dict(state_dict)
+        net.load_state_dict(state_dict, strict=True)
     except RuntimeError as e:
-        raise RuntimeError(
-            f"Checkpoint 与当前模型架构不兼容（可能是旧版 Gaussian 模型）。"
-            f"请用新版代码重新训练。\n错误详情: {e}"
-        ) from e
+        err_msg = str(e)
+        # V1.2 checkpoint：含 src_head，当前为 V1.3 无 src_head，可忽略多余键加载
+        if "Unexpected key(s)" in err_msg and "src_head" in err_msg:
+            net.load_state_dict(state_dict, strict=False)
+            import warnings
+            warnings.warn(
+                "Checkpoint 为 V1.2 格式（含 src_head），已按 V1.3 兼容加载并忽略 src_head。"
+                "推理时仅使用 tgt/prefix 输出。",
+                UserWarning,
+                stacklevel=2,
+            )
+        else:
+            raise RuntimeError(
+                f"Checkpoint 与当前模型架构不兼容（可能是旧版 Gaussian 模型）。"
+                f"请用新版代码重新训练。\n错误详情: {e}"
+            ) from e
     return net, config
 
 
@@ -87,20 +99,18 @@ def get_migration_plan(
     h = ah
     with torch.no_grad():
         for _ in range(K):
-            # 网络输出三组 Categorical logits
-            src_logits, tgt_logits, prefix_logits, _ = net(st, h)
+            # 网络输出两组 Categorical logits（tgt_shard, prefix）
+            tgt_logits, prefix_logits, _ = net(st, h)
             if deterministic:
-                src = src_logits.argmax(dim=-1).item()
                 tgt = tgt_logits.argmax(dim=-1).item()
                 pref = prefix_logits.argmax(dim=-1).item()
             else:
-                src = torch.distributions.Categorical(logits=src_logits).sample().item()
                 tgt = torch.distributions.Categorical(logits=tgt_logits).sample().item()
                 pref = torch.distributions.Categorical(logits=prefix_logits).sample().item()
-            if src != tgt:
-                migrations.append(MigrationTransaction(sender_shard=src, receiver_shard=tgt, prefix=pref))
-            # Update history
-            na = np.array([[src, tgt, pref]], dtype=np.float32)
+            # sender_shard=-1 表示由调用方根据实际映射确定
+            migrations.append(MigrationTransaction(sender_shard=-1, receiver_shard=tgt, prefix=pref))
+            # Update history: 3列格式 (src=0占位, tgt, prefix)
+            na = np.array([[0, tgt, pref]], dtype=np.float32)
             h_np = h[0].cpu().numpy()
             h_np = np.concatenate([h_np[1:], na], axis=0)
             h = torch.tensor(h_np, dtype=torch.float32, device=device).unsqueeze(0)

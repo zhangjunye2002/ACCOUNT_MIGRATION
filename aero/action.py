@@ -60,18 +60,18 @@ def dedup_migrations(
     同一 epoch 内按 prefix 去重：保留每个 prefix 的最后一条有效迁移。
 
     过滤规则：
-    - sender_shard == receiver_shard（无效：原地不动）
-    - prefix / shard 越界
+    - prefix / receiver_shard 越界
     - 同一 prefix 出现多次时只保留最后一条（避免互相冲突 / 回滚）
+
+    注意：不再基于 sender_shard 过滤，因为 sender_shard 由环境在 step()
+    中根据 prefix_to_shard 查表确定（策略不输出 src_shard）。
     """
     seen: set = set()
     out: List[MigrationTransaction] = []
     for m in reversed(plan):
         if not (0 <= m.prefix < num_prefixes):
             continue
-        if not (0 <= m.sender_shard < num_shards and 0 <= m.receiver_shard < num_shards):
-            continue
-        if m.sender_shard == m.receiver_shard:
+        if not (0 <= m.receiver_shard < num_shards):
             continue
         if m.prefix in seen:
             continue

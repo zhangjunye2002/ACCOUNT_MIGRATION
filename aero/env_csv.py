@@ -19,16 +19,27 @@ from .reward import reward_from_state
 
 
 def _parse_action(action: np.ndarray, num_shards: int, num_prefixes: int) -> List[MigrationTransaction]:
-    """与 AEROEnv 一致的 action 解析。"""
+    """
+    解析 action 数组为迁移事务列表。
+
+    action 为 (K, 2) 格式: 每行 (tgt_shard, prefix)。
+    sender_shard 由环境在 step() 中根据 prefix_to_shard 查表确定，
+    此处 MigrationTransaction.sender_shard 暂填 -1 作为占位。
+    """
     if action.ndim == 1:
         action = action.reshape(1, -1)
+    cols = action.shape[1]
     out = []
     for i in range(action.shape[0]):
-        src = int(np.clip(np.round(action[i, 0]), 0, num_shards - 1))
-        tgt = int(np.clip(np.round(action[i, 1]), 0, num_shards - 1))
-        pref = int(np.clip(np.round(action[i, 2]), 0, num_prefixes - 1))
-        if src != tgt:
-            out.append(MigrationTransaction(sender_shard=src, receiver_shard=tgt, prefix=pref))
+        if cols >= 3:
+            # 兼容旧的 3 列格式 (src, tgt, prefix) — 忽略 src
+            tgt = int(np.clip(np.round(action[i, 1]), 0, num_shards - 1))
+            pref = int(np.clip(np.round(action[i, 2]), 0, num_prefixes - 1))
+        else:
+            # 新的 2 列格式 (tgt, prefix)
+            tgt = int(np.clip(np.round(action[i, 0]), 0, num_shards - 1))
+            pref = int(np.clip(np.round(action[i, 1]), 0, num_prefixes - 1))
+        out.append(MigrationTransaction(sender_shard=-1, receiver_shard=tgt, prefix=pref))
     return out
 
 
@@ -144,13 +155,16 @@ class AEROEnvCSV:
         # prefix 去重 + 过滤无效迁移（与 eval 语义一致）
         migrations = dedup_migrations(migrations, self.num_shards, self.num_prefixes)
         applied = 0
+        applied_tuples = []
         for m in migrations:
-            # 用真实当前映射（而非策略预测的 sender_shard）作为迁移源
+            # 用真实当前映射作为迁移源（策略不输出 src_shard）
             current_src = int(self._prefix_to_shard[m.prefix])
             if current_src != m.receiver_shard:
                 self._prefix_to_shard[m.prefix] = m.receiver_shard
                 applied += 1
-        self._action_history.extend(m.to_tuple() for m in migrations)
+                # 动作历史记录真实的 (src, tgt, prefix)，供 attention 编码使用
+                applied_tuples.append((current_src, m.receiver_shard, m.prefix))
+        self._action_history.extend(applied_tuples)
         self._action_history = self._action_history[-self.config.action_history_len :]
         self._epoch += 1
 

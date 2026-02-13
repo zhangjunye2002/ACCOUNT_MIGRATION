@@ -316,9 +316,9 @@ def main():
 
             applied_plan_preview = _format_plan(applied_plan, args.plan_topk)
 
-            # 更新动作历史（记录去重后所有提议，与训练环境一致）
-            for m in plan:
-                action_history_tuples.append(m.to_tuple())
+            # 更新动作历史（记录实际应用的迁移，与训练环境一致）
+            for t in applied_plan:
+                action_history_tuples.append(t)
             action_history_tuples = action_history_tuples[-L:]
 
             print(

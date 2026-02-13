@@ -11,6 +11,9 @@
 > - 新增 **按交易条数切分 epoch**（`--txs-per-epoch`），替代旧的按块切分，每 epoch 样本量更稳定；
 > - 迁移计划增加 **去重逻辑**（同 epoch 内每个 prefix 只保留最后一次有效迁移）；
 > - `train.py` 中 `--csv-path` 变为**必填**参数，不再支持仿真环境训练分支。
+>
+> **版本约定**：当前代码为 **V1.3**（动作空间去掉 src_shard，仅 tgt+prefix）。  
+> 用 **V1.2** 训练的 checkpoint（含 `src_head`）可在本仓库下直接用于评估：`eval_with_csv.py --checkpoint <v1.2的.pt>` 会以兼容方式加载并忽略 src_head。
 
 ---
 

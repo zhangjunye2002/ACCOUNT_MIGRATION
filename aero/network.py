@@ -93,12 +93,11 @@ class AEROAttentionPolicy(nn.Module):
         self.W_O = nn.Linear(self.num_heads * self.d_h, d_model)
 
         # ---- 离散 Categorical 动作头 ----
-        # 共享隐藏层 → 三个独立 logits 分支
+        # 共享隐藏层 → 两个独立 logits 分支（去掉 src_head，因为环境不使用策略输出的 src）
         self.action_hidden = nn.Sequential(
             nn.Linear(d_model, config.num_neurons),
             nn.ReLU(),
         )
-        self.src_head = nn.Linear(config.num_neurons, N)    # → Categorical(N)
         self.tgt_head = nn.Linear(config.num_neurons, N)    # → Categorical(N)
         self.prefix_head = nn.Linear(config.num_neurons, P) # → Categorical(P)
 
@@ -122,19 +121,18 @@ class AEROAttentionPolicy(nn.Module):
         h_cat = head_out.reshape(B, -1)  # (B, H*d_h)
         return self.W_O(h_cat)  # (B, d_model)
 
-    def _logits_from_context(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """从上下文 h 计算三个动作维度的 logits。"""
+    def _logits_from_context(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """从上下文 h 计算两个动作维度的 logits（tgt_shard, prefix）。"""
         a_h = self.action_hidden(h)
-        return self.src_head(a_h), self.tgt_head(a_h), self.prefix_head(a_h)
+        return self.tgt_head(a_h), self.prefix_head(a_h)
 
     def forward(
         self,
         state_vec: torch.Tensor,
         action_history: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Returns (src_logits, tgt_logits, prefix_logits).
-        - src_logits:    (B, num_shards)
+        Returns (tgt_logits, prefix_logits).
         - tgt_logits:    (B, num_shards)
         - prefix_logits: (B, num_prefixes)
         """
@@ -157,15 +155,15 @@ class AEROPolicyValueNet(nn.Module):
         self,
         state_vec: torch.Tensor,
         action_history: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Returns (src_logits, tgt_logits, prefix_logits, value).
+        Returns (tgt_logits, prefix_logits, value).
         只计算一次 _context，同时用于策略和价值。
         """
         h = self.policy_net._context(state_vec, action_history)
-        src_l, tgt_l, pref_l = self.policy_net._logits_from_context(h)
+        tgt_l, pref_l = self.policy_net._logits_from_context(h)
         value = self.value_head(h).squeeze(-1)
-        return src_l, tgt_l, pref_l, value
+        return tgt_l, pref_l, value
 
     def get_action_and_value(
         self,
@@ -174,27 +172,22 @@ class AEROPolicyValueNet(nn.Module):
         action: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        采样/评估一条离散动作 (src, tgt, prefix)。
-        action: (B, 3) float tensor（值为离散索引）; None 则采样。
+        采样/评估一条离散动作 (tgt, prefix)。
+        action: (B, 2) float tensor（值为离散索引）; None 则采样。
         Returns (action, log_prob, entropy, value).
         """
-        src_l, tgt_l, pref_l, value = self.forward(state_vec, action_history)
-        src_dist = torch.distributions.Categorical(logits=src_l)
+        tgt_l, pref_l, value = self.forward(state_vec, action_history)
         tgt_dist = torch.distributions.Categorical(logits=tgt_l)
         prefix_dist = torch.distributions.Categorical(logits=pref_l)
         if action is None:
-            src = src_dist.sample()
             tgt = tgt_dist.sample()
             pref = prefix_dist.sample()
-            action = torch.stack([src, tgt, pref], dim=-1).float()
+            action = torch.stack([tgt, pref], dim=-1).float()
         else:
-            src = action[..., 0].long()
-            tgt = action[..., 1].long()
-            pref = action[..., 2].long()
-        log_prob = (src_dist.log_prob(src)
-                    + tgt_dist.log_prob(tgt)
+            tgt = action[..., 0].long()
+            pref = action[..., 1].long()
+        log_prob = (tgt_dist.log_prob(tgt)
                     + prefix_dist.log_prob(pref))
-        entropy = (src_dist.entropy()
-                   + tgt_dist.entropy()
+        entropy = (tgt_dist.entropy()
                    + prefix_dist.entropy())
         return action, log_prob, entropy, value

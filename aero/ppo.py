@@ -30,27 +30,24 @@ def autoregressive_log_prob(
     """
     计算整段动作序列在当前策略下的 log_prob（Categorical 版本）。
 
-    action_seq: (B, K, 3)，值为离散索引（整数值的 float）。
+    action_seq: (B, K, 2)，值为离散索引（整数值的 float），分别是 (tgt_shard, prefix)。
     """
     B, K, _ = action_seq.shape
     action_history = init_action_history.clone()
     log_probs = []
     for k in range(K):
-        src_logits, tgt_logits, prefix_logits, _ = net(state_vec, action_history)
-        src_dist = torch.distributions.Categorical(logits=src_logits)
+        tgt_logits, prefix_logits, _ = net(state_vec, action_history)
         tgt_dist = torch.distributions.Categorical(logits=tgt_logits)
         prefix_dist = torch.distributions.Categorical(logits=prefix_logits)
-        a_k = action_seq[:, k, :]  # (B, 3) float, integer-valued
-        lp = (src_dist.log_prob(a_k[:, 0].long())
-              + tgt_dist.log_prob(a_k[:, 1].long())
-              + prefix_dist.log_prob(a_k[:, 2].long()))
+        a_k = action_seq[:, k, :]  # (B, 2) float, integer-valued
+        lp = (tgt_dist.log_prob(a_k[:, 0].long())
+              + prefix_dist.log_prob(a_k[:, 1].long()))
         log_probs.append(lp)
-        # 用当前动作更新 history（滑窗）
-        a_clip = a_k.clone()
-        a_clip[:, 0] = a_k[:, 0].clamp(0, num_shards - 1)
-        a_clip[:, 1] = a_k[:, 1].clamp(0, num_shards - 1)
-        a_clip[:, 2] = a_k[:, 2].clamp(0, num_prefixes - 1)
-        action_history = torch.cat([action_history[:, 1:], a_clip.unsqueeze(1)], dim=1)
+        # 用当前动作更新 history（滑窗），history 仍然是 3 列 (src=0占位, tgt, prefix)
+        a_hist = torch.zeros(B, 3, device=a_k.device)
+        a_hist[:, 1] = a_k[:, 0].clamp(0, num_shards - 1)
+        a_hist[:, 2] = a_k[:, 1].clamp(0, num_prefixes - 1)
+        action_history = torch.cat([action_history[:, 1:], a_hist.unsqueeze(1)], dim=1)
     return torch.stack(log_probs, dim=1).sum(dim=1)
 
 
@@ -62,23 +59,21 @@ def autoregressive_entropy(
     num_shards: int,
     num_prefixes: int,
 ) -> torch.Tensor:
-    """按序列累计策略熵（Categorical 版本）。"""
+    """按序列累计策略熵（Categorical 版本，2 维动作）。"""
     B, K, _ = action_seq.shape
     action_history = init_action_history.clone()
     entropies = []
     for k in range(K):
-        src_logits, tgt_logits, prefix_logits, _ = net(state_vec, action_history)
-        src_dist = torch.distributions.Categorical(logits=src_logits)
+        tgt_logits, prefix_logits, _ = net(state_vec, action_history)
         tgt_dist = torch.distributions.Categorical(logits=tgt_logits)
         prefix_dist = torch.distributions.Categorical(logits=prefix_logits)
-        ent = src_dist.entropy() + tgt_dist.entropy() + prefix_dist.entropy()
+        ent = tgt_dist.entropy() + prefix_dist.entropy()
         entropies.append(ent)
-        a_k = action_seq[:, k, :]
-        a_clip = a_k.clone()
-        a_clip[:, 0] = a_k[:, 0].clamp(0, num_shards - 1)
-        a_clip[:, 1] = a_k[:, 1].clamp(0, num_shards - 1)
-        a_clip[:, 2] = a_k[:, 2].clamp(0, num_prefixes - 1)
-        action_history = torch.cat([action_history[:, 1:], a_clip.unsqueeze(1)], dim=1)
+        a_k = action_seq[:, k, :]  # (B, 2)
+        a_hist = torch.zeros(B, 3, device=a_k.device)
+        a_hist[:, 1] = a_k[:, 0].clamp(0, num_shards - 1)
+        a_hist[:, 2] = a_k[:, 1].clamp(0, num_prefixes - 1)
+        action_history = torch.cat([action_history[:, 1:], a_hist.unsqueeze(1)], dim=1)
     return torch.stack(entropies, dim=1).sum(dim=1)
 
 
@@ -91,8 +86,8 @@ def autoregressive_sample(
     num_prefixes: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    自回归地采样一整段离散迁移序列。
-    返回 actions (B, K, 3) float tensor（值为离散索引）, log_prob (B,).
+    自回归地采样一整段离散迁移序列（2 维动作：tgt_shard, prefix）。
+    返回 actions (B, K, 2) float tensor（值为离散索引）, log_prob (B,).
     """
     B = state_vec.shape[0]
     device = state_vec.device
@@ -100,22 +95,22 @@ def autoregressive_sample(
     log_probs_list = []
     h = action_history
     for _ in range(max_migrations):
-        src_logits, tgt_logits, prefix_logits, _ = net(state_vec, h)
-        src_dist = torch.distributions.Categorical(logits=src_logits)
+        tgt_logits, prefix_logits, _ = net(state_vec, h)
         tgt_dist = torch.distributions.Categorical(logits=tgt_logits)
         prefix_dist = torch.distributions.Categorical(logits=prefix_logits)
-        src = src_dist.sample()      # (B,) long
         tgt = tgt_dist.sample()      # (B,) long
         pref = prefix_dist.sample()  # (B,) long
-        a = torch.stack([src, tgt, pref], dim=-1).float()  # (B, 3)
-        lp = (src_dist.log_prob(src)
-              + tgt_dist.log_prob(tgt)
+        a = torch.stack([tgt, pref], dim=-1).float()  # (B, 2)
+        lp = (tgt_dist.log_prob(tgt)
               + prefix_dist.log_prob(pref))
         log_probs_list.append(lp)
         actions_list.append(a)
-        # Update history: append and keep last L
-        h = torch.cat([h[:, 1:], a.unsqueeze(1)], dim=1)
-    actions = torch.stack(actions_list, dim=1)  # (B, K, 3)
+        # Update history: 3列格式 (src=0占位, tgt, prefix)
+        a_hist = torch.zeros(B, 3, device=device)
+        a_hist[:, 1] = tgt.float()
+        a_hist[:, 2] = pref.float()
+        h = torch.cat([h[:, 1:], a_hist.unsqueeze(1)], dim=1)
+    actions = torch.stack(actions_list, dim=1)  # (B, K, 2)
     log_prob = torch.stack(log_probs_list, dim=1).sum(dim=1)  # (B,)
     return actions, log_prob
 
@@ -152,7 +147,7 @@ def ppo_update(
         returns[t] = g
     st = torch.tensor(states, dtype=torch.float32, device=device)
     ah = torch.tensor(action_histories, dtype=torch.float32, device=device)
-    _, _, _, values = net(st, ah)
+    _, _, values = net(st, ah)
     values_np = values.detach().cpu().numpy()
     adv = returns - values_np
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -173,7 +168,7 @@ def ppo_update(
                 net, sb_st, sb_ah, sb_act,
                 config.num_shards, config.num_prefixes,
             )
-            _, _, _, new_value = net(sb_st, sb_ah)
+            _, _, new_value = net(sb_st, sb_ah)
             seq_entropy = autoregressive_entropy(
                 net, sb_st, sb_ah, sb_act,
                 config.num_shards, config.num_prefixes,
